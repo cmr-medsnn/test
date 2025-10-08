@@ -1,0 +1,285 @@
+Add the following changes to the generate_batch_predictions function. update the function and the code relying on it, accordingly.
+	add a saving option to save the predicted lay summaries into an output file
+	
+	New Args:
+		a controlling argument - boolean : whether to save the generated texts or not - if true, the file name should be the model name + lay_summaries
+		output - default: config["output_dir"] - It must create the path if it doesn't exist.
+
+keep the code clean, concise, optimised and structured. ensure relevancy and effectiveness
+
+
+
+
+# ========== Generation Logic ==========
+def generate_batch_predictions(model, input_ids, tokenizer, batch_size=4, max_new_tokens=256):
+    """Efficiently generate predictions in memory-aware batches"""
+    model.eval()
+    predictions = []
+
+    total = len(input_ids)
+    for start in tqdm(range(0, total, batch_size), desc="Generating Predictions"):
+        try:
+            batch_input = input_ids[start:start + batch_size].to(CONFIG["device"])
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids=batch_input,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=5,
+                    early_stopping=True,
+                    use_cache=True
+                )
+            decoded_batch = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            predictions.extend(decoded_batch)
+        except RuntimeError as err:
+            if 'out of memory' in str(err).lower():
+                print(f"⚠️ OOM at batch {start}. Retrying with reduced batch size...")
+                torch.cuda.empty_cache()
+                gc.collect()
+                reduced_batch_size = max(1, batch_size // 2)
+                return generate_batch_predictions(model, input_ids, tokenizer, batch_size=reduced_batch_size, max_new_tokens=max_new_tokens)
+            raise
+        finally:
+            del batch_input, output_ids
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    return predictions
+    
+    
+    
+    
+    
+    
+    
+# ========== Evaluation Logic ==========
+def evaluate_model_sari(
+    model_path, sources, references,
+    use_instruction_tuning=False, few_shot=True,
+    batch_size=4, max_new_tokens=256
+):
+    """Main evaluation function for SARI using a model checkpoint"""
+    model, tokenizer = None, None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_path).to(CONFIG["device"])
+
+        prompts = build_instruction_prompts(sources, few_shot) if use_instruction_tuning else sources
+        tokenized = tokenizer(prompts, padding=True, truncation=True, return_tensors="pt")
+        input_ids = tokenized["input_ids"].to(CONFIG["device"])
+
+        predictions = generate_batch_predictions(model, input_ids, tokenizer, batch_size, max_new_tokens)
+        return evaluate_sari_performance(sources, predictions, references)
+    finally:
+        del model, tokenizer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+# ========== Retry Wrapper ==========
+def retry_on_oom(*args, desc="Evaluation", **kwargs):
+    """Retry evaluation once in case of global OOM"""
+    try:
+        return evaluate_model_sari(*args, **kwargs)
+    except RuntimeError as err:
+        if 'out of memory' in str(err).lower():
+            print(f"⚠️ Global OOM during {desc}. Retrying...")
+            torch.cuda.empty_cache()
+            gc.collect()
+            return evaluate_model_sari(*args, **kwargs)
+        raise
+
+
+
+
+
+
+
+
+import os
+import gc
+import logging
+import pandas as pd
+import numpy as np
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from evaluate import load as load_metric
+from textstat import flesch_kincaid_grade, gunning_fog, coleman_liau_index
+from tqdm.auto import tqdm
+from typing import List, Dict, Any
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# --- 1. Core Evaluation Function ---
+# ===================================================================
+
+def evaluate_models(
+    test_set: Dict[str, List[str]],
+    biolay_models: Dict[str, str],
+    evaluation_metrics: Dict[str, Any],
+    config: Dict[str, Any],
+    fig_dir: str,
+    fig_name: str = "evaluation_results.csv"
+) -> pd.DataFrame:
+    """
+    Evaluates text simplification models across various metrics and saves the results.
+    ... (docstring remains the same) ...
+    """
+    try:
+        os.makedirs(fig_dir, exist_ok=True)
+    except OSError as e:
+        logger.error(f"Error creating directory {fig_dir}: {e}")
+        return pd.DataFrame()
+
+    all_results = {}
+    bert_scorer = load_metric("bertscore")
+    sources = test_set["test_source"]
+    references = test_set["test_target"]
+
+    # ADDED: Define metric keys beforehand for robust error handling.
+    METRIC_KEYS = [
+        "SARI", "BLEU", "ROUGE-1", "ROUGE-2", "ROUGE-L",
+        "BERTScore-P", "BERTScore-R", "BERTScore-F1",
+        "FKG", "GFI", "CLI"
+    ]
+
+    for model_name, model_path in biolay_models.items():
+        logger.info(f"--- Evaluating model: {model_name} ---")
+        model, tokenizer = None, None
+        try:
+            # 1. Load Model & Tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_path).to(config["device"])
+            
+            # 2. Prepare inputs and generate predictions
+            prompts = build_instruction_prompts(sources)
+            tokenized_inputs = tokenizer(
+                prompts, return_tensors="pt", padding=True, truncation=True
+            ).input_ids
+            
+            predictions = generate_batch_predictions(
+                model, tokenized_inputs, tokenizer, batch_size=4
+            )
+
+            # 3. Compute Metrics
+            logger.info("Computing metrics...")
+            
+            # N-gram metrics
+            rouge_scores = evaluation_metrics["ROUGE"].compute(predictions=predictions, references=references)
+            bleu_score = evaluation_metrics["BLEU"].compute(predictions=predictions, references=references)
+            sari_score = evaluation_metrics["SARI"].compute(sources=sources, predictions=predictions, references=[[r] for r in references])
+
+            # Semantic metric (BERTScore)
+            bert_scores = bert_scorer.compute(predictions=predictions, references=references, lang="en")
+
+            # Readability metrics
+            readability_scores = compute_readability_metrics(predictions)
+            
+            # 4. Store results
+            all_results[model_name] = {
+                "SARI": sari_score["sari"],
+                "BLEU": bleu_score["bleu"] * 100,
+                # CHANGED: Access ROUGE scores directly. The .mid.fmeasure attribute is no longer used.
+                "ROUGE-1": rouge_scores["rouge1"] * 100,
+                "ROUGE-2": rouge_scores["rouge2"] * 100,
+                "ROUGE-L": rouge_scores["rougeL"] * 100,
+                "BERTScore-P": np.mean(bert_scores["precision"]),
+                "BERTScore-R": np.mean(bert_scores["recall"]),
+                "BERTScore-F1": np.mean(bert_scores["f1"]),
+                "FKG": np.mean(readability_scores["FKG"]),
+                "GFI": np.mean(readability_scores["GFI"]),
+                "CLI": np.mean(readability_scores["CLI"]),
+            }
+            logger.info(f"Scores for {model_name}: {all_results[model_name]}")
+
+        except Exception as e:
+            logger.error(f"An error occurred while evaluating {model_name}: {e}", exc_info=True)
+            all_results[model_name] = {metric: "Error" for metric in METRIC_KEYS}
+        
+        finally:
+            # 5. Clean up GPU memory
+            del model, tokenizer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+    results_df = pd.DataFrame.from_dict(all_results, orient='index')
+    
+    # Save results to file
+    output_path = os.path.join(fig_dir, fig_name)
+    results_df.to_csv(output_path)
+    logger.info(f"Evaluation results saved to {output_path}")
+
+    return results_df
+
+
+# --- 2. Results Display Function ---
+# ===================================================================
+
+def display_results_table(
+    results_df: pd.DataFrame,
+    caption: str = "Model Performance Evaluation",
+    label: str = "tab:model_performance"
+):
+    """
+    Prints model evaluation results in a publication-quality LaTeX table format.
+
+    Args:
+        results_df (pd.DataFrame): The DataFrame returned by the evaluate_models function.
+        caption (str): The caption for the LaTeX table.
+        label (str): The label for referencing the table in a LaTeX document.
+    """
+    if results_df.empty:
+        logger.warning("Cannot display table: The results DataFrame is empty.")
+        return
+
+    # Format the DataFrame for better presentation
+    formatted_df = results_df.copy()
+    for col in formatted_df.columns:
+        # This check handles columns that might contain non-numeric "Error" strings
+        if pd.api.types.is_numeric_dtype(formatted_df[col]):
+            formatted_df[col] = formatted_df[col].apply(
+                lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x
+            )
+
+    # Define column format for LaTeX table
+    num_cols = len(formatted_df.columns)
+    col_format = "l" + "c" * num_cols  # Left-align model names, center-align scores
+
+    try:
+        # Generate LaTeX string
+        latex_table = formatted_df.to_latex(
+            index=True,
+            caption=caption,
+            label=label,
+            header=True,
+            column_format=col_format,
+            multicolumn_format='c',
+            escape=False,
+            
+        )
+
+        header = f"""
+% ===================================================================
+% LaTeX Results Table for Publication
+% Ensure you have the 'booktabs' package in your LaTeX document:
+% \\usepackage{{booktabs}}
+% ===================================================================
+"""
+        # The caption and label are now handled by to_latex, so we simplify the wrapper
+        full_output = f"{header}\n{latex_table}"
+
+        logger.info("--- LaTeX formatted results table ---")
+        print(full_output)  # Use print to ensure clean output without logger prefixes
+
+    except Exception as e:
+        logger.error(f"Failed to generate LaTeX table: {e}")
+        logger.info("--- Displaying results as standard DataFrame ---")
+        # Fallback to a clean markdown table if LaTeX fails
+        print(formatted_df.to_markdown())
+
